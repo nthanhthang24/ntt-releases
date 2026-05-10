@@ -164,7 +164,10 @@ jobs:
           echo "::group::Demoting stale releases to Draft"
           echo "$STALE" | jq -r '.[] | "\(.id) \(.tag_name)"' | while read -r id tag; do
             echo "Demoting $tag (id=$id) → draft=true"
-            gh api -X PATCH "repos/$REPO/releases/$id" -f draft=true >/dev/null
+            # `-F` (uppercase) sends typed JSON (bool true), unlike `-f` which
+            # would send the string "true" — and GitHub silently ignores a
+            # string in a boolean field, leaving the release Published.
+            gh api -X PATCH "repos/$REPO/releases/$id" -F draft=true >/dev/null
           done
           echo "::endgroup::"
 
