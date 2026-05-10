@@ -1,0 +1,112 @@
+name: Enforce Single-Published Release Per Product
+
+# Inviolable invariant: only ONE Published release per product
+# (ntttool / zing / vmar / vmip) at any time. The edge-api
+# `/v2/updates/active` GitHub fallback picks the newest non-draft
+# non-prerelease matching a product prefix; stale Published releases
+# pollute the listing and break "single source of truth" guarantees.
+#
+# This workflow fires whenever a release is published — by gh CLI,
+# the GitHub UI, the API, or any build script — and demotes every
+# OTHER previously-Published release of the same product to Draft.
+# That makes the rule un-bypassable: local scripts can skip the
+# demote step but this server-side hook cannot.
+
+on:
+  release:
+    # `published` fires for both "Save as draft → Publish" and direct
+    # `gh release create` (which publishes immediately). Covers every
+    # path that flips draft=false.
+    types: [published]
+
+permissions:
+  contents: write   # PATCH /releases/:id requires repo write
+
+jobs:
+  demote-other-published:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Demote stale Published releases for the same product
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_TAG:  ${{ github.event.release.tag_name }}
+          NEW_ID:   ${{ github.event.release.id }}
+          REPO:     ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "::group::Resolving product from tag '$NEW_TAG'"
+
+          # tag_prefix → product. Same map as edge-api loadFromGitHub
+          # (v3/edge-api/src/routes/client/updates.ts:101-106). When a
+          # new product gets added, update BOTH places.
+          declare -A PREFIXES=(
+            [ntttool-v]=ntttool
+            [nttool-v]=ntttool
+            [zing-v]=zing
+            [zingtools-v]=zing
+            [vmar-v]=vmar
+            [mumuaccountrunner-v]=vmar
+            [vmip-v]=vmip
+          )
+
+          PRODUCT=""
+          MATCHED_PREFIX=""
+          for prefix in "${!PREFIXES[@]}"; do
+            if [[ "${NEW_TAG,,}" == ${prefix,,}* ]]; then
+              PRODUCT="${PREFIXES[$prefix]}"
+              MATCHED_PREFIX="$prefix"
+              break
+            fi
+          done
+
+          if [[ -z "$PRODUCT" ]]; then
+            echo "Tag '$NEW_TAG' does not match any known product prefix — nothing to enforce."
+            exit 0
+          fi
+          echo "Product: $PRODUCT (matched prefix: $MATCHED_PREFIX)"
+          echo "::endgroup::"
+
+          echo "::group::Collecting all valid prefixes for product '$PRODUCT'"
+          # Reverse map: every prefix that maps to this product. A vmar
+          # release tagged `mumuaccountrunner-v...` must demote a
+          # later-tagged `vmar-v...` and vice versa.
+          PRODUCT_PREFIXES=()
+          for prefix in "${!PREFIXES[@]}"; do
+            if [[ "${PREFIXES[$prefix]}" == "$PRODUCT" ]]; then
+              PRODUCT_PREFIXES+=("$prefix")
+            fi
+          done
+          echo "Prefixes: ${PRODUCT_PREFIXES[*]}"
+          echo "::endgroup::"
+
+          echo "::group::Listing currently Published releases for product '$PRODUCT'"
+          # Pull every Published release (paginated) and filter to ones
+          # whose tag starts with one of this product's prefixes AND
+          # isn't the release that just triggered this workflow.
+          PREFIXES_JSON=$(printf '%s\n' "${PRODUCT_PREFIXES[@]}" | jq -R . | jq -s .)
+          STALE=$(gh api "repos/$REPO/releases" --paginate --jq "
+            [ .[]
+              | select(.draft == false)
+              | select(.id != $NEW_ID)
+              | select(any($PREFIXES_JSON[]; . as \$p | (.tag_name | ascii_downcase | startswith(\$p | ascii_downcase))))
+              | {id, tag_name}
+            ]
+          ")
+          STALE_COUNT=$(echo "$STALE" | jq 'length')
+          echo "Found $STALE_COUNT stale Published release(s)"
+          echo "$STALE" | jq -r '.[] | "  - \(.tag_name) (id=\(.id))"'
+          echo "::endgroup::"
+
+          if [[ "$STALE_COUNT" -eq 0 ]]; then
+            echo "Invariant already satisfied — no action needed."
+            exit 0
+          fi
+
+          echo "::group::Demoting stale releases to Draft"
+          echo "$STALE" | jq -r '.[] | "\(.id) \(.tag_name)"' | while read -r id tag; do
+            echo "Demoting $tag (id=$id) → draft=true"
+            gh api -X PATCH "repos/$REPO/releases/$id" -f draft=true >/dev/null
+          done
+          echo "::endgroup::"
+
+          echo "::notice title=Single-Published Invariant::Demoted $STALE_COUNT stale $PRODUCT release(s); kept $NEW_TAG as the sole Published."
