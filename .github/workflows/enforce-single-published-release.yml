@@ -14,10 +14,13 @@ name: Enforce Single-Published Release Per Product
 
 on:
   release:
-    # `published` fires for both "Save as draft → Publish" and direct
-    # `gh release create` (which publishes immediately). Covers every
-    # path that flips draft=false.
-    types: [published]
+    # `published` fires when draft=false (UI publish or `gh release create`).
+    # `released` fires only for non-pre-release published events.
+    # `created` covers `gh release create` paths some report as not firing
+    # `published` (API direct, automation tools). The job logic is idempotent
+    # and bails out if the release that triggered it isn't actually Published,
+    # so duplicate firings are safe.
+    types: [published, released, created]
   # Allow manual replay against an existing tag — used for backfill
   # sweeps and for testing the demote logic without creating a fresh
   # release. Pass tag_name as input; logic mirrors the release event.
@@ -54,11 +57,24 @@ jobs:
             # Resolve id from tag for manual dispatch
             ID=$(gh api "repos/$REPO/releases/tags/$TAG" --jq .id)
           fi
+          # Idempotency guard: when both `published` and `created` fire for
+          # the same release, this job runs twice. The second run only does
+          # work if it sees the triggering release as still Published — which
+          # it should, but we re-check authoritative state from the API rather
+          # than trusting the event payload (which can be stale on retry).
+          DRAFT=$(gh api "repos/$REPO/releases/$ID" --jq .draft)
+          if [[ "$DRAFT" != "false" ]]; then
+            echo "Triggering release '$TAG' is currently draft=$DRAFT — nothing to enforce, exiting."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "id=$ID"   >> "$GITHUB_OUTPUT"
-          echo "Resolved: tag=$TAG id=$ID"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Resolved: tag=$TAG id=$ID (Published)"
 
       - name: Demote stale Published releases for the same product
+        if: steps.target.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NEW_TAG:  ${{ steps.target.outputs.tag }}
