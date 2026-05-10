@@ -18,6 +18,15 @@ on:
     # `gh release create` (which publishes immediately). Covers every
     # path that flips draft=false.
     types: [published]
+  # Allow manual replay against an existing tag — used for backfill
+  # sweeps and for testing the demote logic without creating a fresh
+  # release. Pass tag_name as input; logic mirrors the release event.
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Existing release tag to enforce against (e.g. vmar-v2026.5.9.30)"
+        required: true
+        type: string
 
 permissions:
   contents: write   # PATCH /releases/:id requires repo write
@@ -26,11 +35,34 @@ jobs:
   demote-other-published:
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve target tag (release event vs manual dispatch)
+        id: target
+        env:
+          GH_TOKEN:    ${{ secrets.GITHUB_TOKEN }}
+          REPO:        ${{ github.repository }}
+          EVENT_NAME:  ${{ github.event_name }}
+          REL_TAG:     ${{ github.event.release.tag_name }}
+          REL_ID:      ${{ github.event.release.id }}
+          MANUAL_TAG:  ${{ github.event.inputs.tag_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            TAG="$REL_TAG"
+            ID="$REL_ID"
+          else
+            TAG="$MANUAL_TAG"
+            # Resolve id from tag for manual dispatch
+            ID=$(gh api "repos/$REPO/releases/tags/$TAG" --jq .id)
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "id=$ID"   >> "$GITHUB_OUTPUT"
+          echo "Resolved: tag=$TAG id=$ID"
+
       - name: Demote stale Published releases for the same product
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NEW_TAG:  ${{ github.event.release.tag_name }}
-          NEW_ID:   ${{ github.event.release.id }}
+          NEW_TAG:  ${{ steps.target.outputs.tag }}
+          NEW_ID:   ${{ steps.target.outputs.id }}
           REPO:     ${{ github.repository }}
         run: |
           set -euo pipefail
