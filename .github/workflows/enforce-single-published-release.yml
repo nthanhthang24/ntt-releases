@@ -115,12 +115,23 @@ jobs:
           # Pull every Published release (paginated) and filter to ones
           # whose tag starts with one of this product's prefixes AND
           # isn't the release that just triggered this workflow.
-          PREFIXES_JSON=$(printf '%s\n' "${PRODUCT_PREFIXES[@]}" | jq -R . | jq -s .)
+          # Build a jq `or` chain dynamically — simpler + more debuggable
+          # than passing an array variable into the jq stream context.
+          PREFIX_FILTER=""
+          for p in "${PRODUCT_PREFIXES[@]}"; do
+            p_lower=$(echo "$p" | tr '[:upper:]' '[:lower:]')
+            if [[ -z "$PREFIX_FILTER" ]]; then
+              PREFIX_FILTER="startswith(\"$p_lower\")"
+            else
+              PREFIX_FILTER="$PREFIX_FILTER or startswith(\"$p_lower\")"
+            fi
+          done
+          echo "jq prefix filter: $PREFIX_FILTER"
           STALE=$(gh api "repos/$REPO/releases" --paginate --jq "
             [ .[]
               | select(.draft == false)
               | select(.id != $NEW_ID)
-              | select(any($PREFIXES_JSON[]; . as \$p | (.tag_name | ascii_downcase | startswith(\$p | ascii_downcase))))
+              | select(.tag_name | ascii_downcase | ($PREFIX_FILTER))
               | {id, tag_name}
             ]
           ")
